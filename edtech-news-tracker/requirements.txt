@@ -1,0 +1,6 @@
+parallel-web>=0.1.0
+python-dotenv>=1.0.0
+openpyxl>=3.1.0
+tqdm>=4.66.0
+deep-translator>=1.11.4
+python-dateutil>=2.8.2

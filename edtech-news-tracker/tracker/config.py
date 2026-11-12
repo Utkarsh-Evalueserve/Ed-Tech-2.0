@@ -95,6 +95,13 @@ class Settings:
     # and -- as far as can be observed without published per-mode pricing --
     # cost). "basic" is a reasonable default for the official/global lanes,
     # which are comparatively few calls (560 total) with a good hit rate.
+    # Results scoring below this are dropped (0 disables). Reviewed runs showed
+    # nearly every "Low confidence" (<0.55) row was irrelevant.
+    min_relevance: float = float(os.getenv("MIN_RELEVANCE", "0.5"))
+    # Extra companies (comma-separated names) that must show education context.
+    edu_context_companies: set[str] = field(
+        default_factory=lambda: {c.strip().lower() for c in os.getenv("EDU_CONTEXT_COMPANIES", "Criteria,Orijin").split(",") if c.strip()}
+    )
     parallel_mode: str = os.getenv("PARALLEL_MODE", "basic")
     max_results_per_query: int = int(os.getenv("MAX_RESULTS_PER_QUERY", "10"))
     # The geography lane is the expensive one (tens of thousands of calls,
@@ -111,9 +118,9 @@ class Settings:
     budget_usd: float = float(os.getenv("BUDGET_USD", "25"))
     # Fraction of the budget held back for full-text extraction of the final
     # (deduplicated) articles, so searching can never starve summaries.
-    extract_reserve_fraction: float = float(os.getenv("EXTRACT_RESERVE_FRACTION", "0.12"))
+    extract_reserve_fraction: float = float(os.getenv("EXTRACT_RESERVE_FRACTION", "0.05"))
     # Safety margin kept unspent to absorb price estimate error.
-    safety_margin_fraction: float = float(os.getenv("SAFETY_MARGIN_FRACTION", "0.05"))
+    safety_margin_fraction: float = float(os.getenv("SAFETY_MARGIN_FRACTION", "0.04"))
     search_cost_usd: float = float(
         os.getenv("SEARCH_COST_USD", "") or {"advanced": 0.01}.get(os.getenv("PARALLEL_MODE", "basic"), 0.005)
     )

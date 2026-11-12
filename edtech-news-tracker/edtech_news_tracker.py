@@ -32,18 +32,20 @@ from tracker.excel_loader import (
 from tracker.exporter import RunLog, export
 from tracker.parallel_client import ParallelClient, RawResult
 from tracker.budget import BudgetTracker
+from tracker.gate import edu_hits_needed, has_edu_context, is_listing_or_spam, names_a_excluded_entity, requires_edu_context
 from tracker.planner import choose_batch_size, group_geographies, plan_geo_units, unit_key
 from tracker.query_builder import (
-    SearchTask, build_geography_group_task, build_global_broad_task, build_official_press_task,
+    SearchTask, build_geography_group_task, build_topic_tasks, build_global_broad_task, build_official_press_task,
 )
 from tracker.relevance import (
     Article, classify_category, company_mentioned_prominently, detect_geography,
-    is_excluded_noise, is_generic_page, is_prominent_in_full_text, score_relevance,
+    FALLBACK_CATEGORY, is_excluded_noise, is_generic_page, is_prominent_in_full_text, score_relevance,
 )
 from tracker.summarizer import clean_short_summary, summarize
 from tracker.translator import translate_to_english
 
 DATE_FMT = "%Y-%m-%d"
+SATURATED: set[str] = set()  # companies whose core searches returned a full page
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +203,8 @@ def _raw_result_to_article(
     if is_generic_page(result.url, result.title, result.source_domain, task.company):
         return None  # LinkedIn/Wikipedia/Crunchbase/"About Us"-style pages, not news
 
+    if not (result.title or "").strip():
+        return None  # no headline = a landing/listing page, not an article
     headline_en, headline_ok = translate_to_english(result.title)
     summary_raw = result.excerpt[:600]
     summary_en, summary_ok = translate_to_english(summary_raw)
@@ -213,15 +217,36 @@ def _raw_result_to_article(
         return None  # name only appears in passing, not actually about this company
 
     combined_text = f"{headline_en} {summary_en}"
+    full_excerpt = f"{result.title} {result.excerpt}"
+
+    # --- precision gate: listing pages, investor-alert spam, wrong entity, off-topic ---
+    if is_listing_or_spam(result.url, headline_en, full_excerpt):
+        return None
+    if names_a_excluded_entity(task.company, full_excerpt):
+        return None
+    if (not is_own_domain
+            and requires_edu_context(task.company, settings.edu_context_companies)
+            and not has_edu_context(full_excerpt, edu_hits_needed(task.company))):
+        return None  # e.g. Mastercard payments, Gates medical grant, Apollo private equity
+
     category = classify_category(combined_text)
     if category is None:
-        return None  # no recognizable news-category signal at all
+        # Never lose a genuinely company-specific story just because it uses no
+        # stock keyword (e.g. "British Council to host ... forum"): keep it when
+        # the company is in the headline, under a catch-all category.
+        names_l = [n.lower() for n in task.company.all_names()]
+        if any(n in headline_en.lower() for n in names_l):
+            category = FALLBACK_CATEGORY
+        else:
+            return None
     if is_excluded_noise(combined_text, category):
         return None
 
     score = score_relevance(
         task.company, headline_en, summary_en, result.source_domain, within_window, date_known
     )
+    if score < settings.min_relevance and not is_own_domain:
+        return None  # low-confidence = overwhelmingly irrelevant in reviewed runs
 
     review_reasons = []
     if score < settings.relevance_review_threshold:
@@ -239,7 +264,7 @@ def _raw_result_to_article(
     if task.geography:
         geography_name = task.geography.country
     elif task.geographies:  # multi-country group call: attribute by explicit mention, else the group
-        geography_name = detect_geography(combined_text, task.geographies, default=", ".join(g.country for g in task.geographies))
+        geography_name = detect_geography(combined_text, task.geographies, default="Multiple / not specified")
     else:
         geography_name = detect_geography(combined_text, geographies)
 
@@ -275,8 +300,11 @@ def run_tasks(tasks: list[SearchTask], client: ParallelClient, settings: Setting
             else settings.max_results_per_query
         )
         raw_results = client.search(
-            task.objective, task.search_queries, task.company.name, task.lane, max_results=max_results
+            task.objective, task.search_queries, task.company.name, task.lane, max_results=max_results,
+            after_date=start_dt.strftime(DATE_FMT),
         )
+        if task.lane in ("official_press", "global_broad") and len(raw_results) >= max(1, max_results - 1):
+            SATURATED.add(task.company.name)  # a full page of results: more stories likely exist
         for r in raw_results:
             art = _raw_result_to_article(r, task, geographies, settings, start_dt, end_dt)
             if art:
@@ -551,6 +579,22 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n\nInterrupted. Progress has been saved -- rerun with the same date range to resume.")
         return 130
+
+    # Phase 3: deep dive for saturated (high-volume) companies with leftover budget.
+    def deep_unit(c):
+        if not client.can_search():
+            return None
+        return run_tasks(build_topic_tasks(c, s_str, e_str), client, settings, geographies, start_dt, end_dt)
+
+    deep_todo = [c for c in companies if c.name in SATURATED and unit_key("deep", c) not in completed_companies]
+    if deep_todo and client.can_search():
+        print(f"\nDeep dive for {len(deep_todo)} high-volume companies (3 topic searches each, budget permitting)...")
+        try:
+            _run_units([(unit_key("deep", c), c.name, (c,)) for c in deep_todo], deep_unit, client,
+                       completed_companies, articles, settings, start_tag, end_tag, "Deep dive")
+        except KeyboardInterrupt:
+            print("\nInterrupted. Progress saved.")
+            return 130
 
     # Companies whose core lanes AND all country calls found nothing
     found_companies = {a.company for a in articles}

@@ -250,3 +250,14 @@ How coverage is kept high within the cap:
 
 Costs are **estimates** ($0.005/search, $0.001/URL by default). Check your
 Parallel.ai pricing and set `SEARCH_COST_USD` / `EXTRACT_COST_USD` if different.
+
+## Relevance & recall tuning (Nov 2026)
+- Server-side date filter (`source_policy.after_date`) and noise-domain exclusion on every search.
+- Precision gate (`tracker/gate.py`): drops listing/events/tender/archive pages, law-firm investor alerts,
+  entities named after "NOT" in the Notes column, and off-topic news about NGO/adjacent-corporate
+  companies (Category F/H, or Notes containing ONLY/NOT) that lacks education context. Results below
+  `MIN_RELEVANCE` (default 0.5) are dropped. Set `EDU_CONTEXT_COMPANIES=Criteria,Orijin,...` for more.
+- Recall: stories with no stock keyword are kept as "Other Relevant News" instead of dropped; broader
+  category keywords (forums, events, recognitions, studies, curricula, grants...); a deep-dive lane
+  (3 topic searches) for high-volume companies whose core searches came back full (e.g. OpenAI).
+- Companies not on the tracking list (e.g. UNESCO) are never searched - add them to the Companies sheet.

@@ -205,6 +205,38 @@ def build_geography_group_task(
     return SearchTask(company, "geography", objective, queries, geographies=geos)
 
 
+_TOPIC_FOCI = [
+    ("partnerships, agreements, MOUs, collaborations, investments, funding, acquisitions, grants, "
+     "scholarships and education-sector deployments",
+     "partners with OR agreement OR MOU OR funding OR acquires OR grant OR scholarship"),
+    ("product launches, new features, AI tools, research studies and reports, curricula and programmes, "
+     "events, forums, workshops, conferences and webinars",
+     "launches OR unveils OR new feature OR study OR report OR forum OR workshop OR conference"),
+    ("leadership appointments, awards and recognitions, regulation and government policy, lawsuits, "
+     "controversies, data breaches, layoffs and financial results",
+     "appoints OR named OR award OR regulation OR lawsuit OR breach OR layoffs OR results"),
+]
+
+
+def build_topic_tasks(company: Company, start_date: str, end_date: str) -> List[SearchTask]:
+    """Deep-dive lane for high-volume companies whose core searches came back
+    full (e.g. OpenAI, Duolingo): one call per topic cluster so a day's worth
+    of stories is not capped by a single 10-result call."""
+    aliases_txt = ", ".join(company.aliases) if company.aliases else "no aliases"
+    tasks = []
+    for focus, kw in _TOPIC_FOCI:
+        objective = (
+            f"Find ALL distinct news stories, from any country or language, that are SPECIFICALLY ABOUT "
+            f"'{company.name}' (also known as: {aliases_txt}), focused on: {focus}. Prefer the most "
+            f"specific article URL for each distinct story (never a homepage, tag or listing page) and "
+            f"return as many different stories as exist rather than repeated coverage of one. "
+            f"{_date_window_clause(start_date, end_date)}{_notes_clause(company)}"
+        )
+        queries = [f"{_alias_clause(company)} {kw}", f'"{company.name}" news {start_date}']
+        tasks.append(SearchTask(company, "topic_deep_dive", objective, queries))
+    return tasks
+
+
 def build_tasks_for_company(
     company: Company, geographies: List[Geography], start_date: str, end_date: str
 ) -> List[SearchTask]:

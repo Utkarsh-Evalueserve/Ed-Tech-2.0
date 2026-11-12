@@ -27,6 +27,14 @@ except ImportError:  # pragma: no cover - surfaced clearly at runtime instead
     Parallel = None
 
 
+# Reference/profile/aggregator sites that are never a news article about a company.
+NOISE_DOMAINS = [
+    "linkedin.com", "crunchbase.com", "wikipedia.org", "glassdoor.com", "indeed.com",
+    "owler.com", "zoominfo.com", "pitchbook.com", "facebook.com", "reddit.com",
+    "youtube.com", "tiktok.com", "instagram.com", "x.com", "twitter.com",
+]
+
+
 @dataclass
 class RawResult:
     url: str
@@ -92,6 +100,7 @@ class ParallelClient:
         lane: str,
         geography: Optional[str] = None,
         max_results: Optional[int] = None,
+        after_date: Optional[str] = None,
     ) -> List[RawResult]:
         """Run one search task with retry/backoff. Never raises; on final
         failure it records the failure and returns an empty list so the run
@@ -108,11 +117,17 @@ class ParallelClient:
         with self._sem:
             for attempt in range(self.max_retries + 1):
                 try:
+                    policy = {"exclude_domains": NOISE_DOMAINS}
+                    if after_date:
+                        # Native server-side date filter: stale pages never
+                        # consume one of the limited result slots.
+                        policy["after_date"] = after_date
                     resp = self._client.search(
                         objective=objective,
                         search_queries=queries,
                         mode=self.mode,
                         advanced_settings={
+                            "source_policy": policy,
                             "max_results": max_results if max_results is not None else self.max_results,
                             # A larger excerpt means the short fallback summary
                             # (used whenever full-text extraction fails) is more

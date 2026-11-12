@@ -19,15 +19,15 @@ _EXCLUDE_RE = re.compile("|".join(EXCLUDE_PATTERNS), re.IGNORECASE)
 
 _CATEGORY_KEYWORDS = {
     "Executive & Leadership Changes": ["ceo", "cfo", "coo", "appoint", "steps down", "resign", "named president", "new chief", "hires", "promoted"],
-    "Strategic Moves (M&A, Partnerships, Investments, Funding)": ["acquisition", "acquire", "merger", "partner", "invest", "funding", "raises", "series a", "series b", "series c", "stake", "collaborat", "mou", "memorandum of understanding", "signs agreement", "pilot program"],
+    "Strategic Moves (M&A, Partnerships, Investments, Funding)": ["acquisition", "acquire", "merger", "partner", "invest", "funding", "raises", "series a", "series b", "series c", "stake", "collaborat", "mou", "memorandum of understanding", "signs agreement", "pilot program", "teams up", "teams with", "cooperation", "alliance", "joint venture", "agreement", "grant", "financial support", "scholarship", "sponsor"],
     "Office Openings/Expansions": ["opens office", "expansion", "new office", "expands to", "opens new"],
-    "New Products/Launches": ["launch", "unveils", "introduces", "new product", "rolls out", "release of"],
-    "Marketing Campaigns": ["campaign", "marketing", "brand partnership", "sponsorship", "conference", "summit", "seminar", "conclave", "workshop", "keynote"],
+    "New Products/Launches": ["launch", "unveils", "introduces", "new product", "rolls out", "release of", "curriculum", "plugin", "new feature", "new course", "new programme", "new program", "introduced", "debuts", "available now", "control room"],
+    "Marketing Campaigns": ["campaign", "marketing", "brand partnership", "sponsorship", "conference", "summit", "seminar", "conclave", "workshop", "keynote", "forum", "to host", "hosts", "event", "webinar", "expo", "showcase", "festival", "roadshow", "open day", "masterclass"],
     "Market Entry/Exit": ["enters market", "market entry", "exits", "withdraws from", "shuts down operations"],
-    "Government/Regulatory Developments": ["regulation", "regulatory", "government", "ministry", "policy", "compliance", "approval from", "accreditation", "accredited", "certification", "certified by"],
-    "Awards": ["award", "wins", "recognized", "honored", "named best", "named a luminary", "ranked among"],
+    "Government/Regulatory Developments": ["regulation", "regulatory", "government", "ministry", "policy", "policies", "compliance", "legislation", "ministry of education", "department of education", "approval from", "accreditation", "accredited", "certification", "certified by"],
+    "Awards": ["award", "wins", "recognized", "honored", "named best", "named a luminary", "ranked among", "recognizes", "recognises", "recognised", "outstanding", "achievement", "finalist", "shortlisted", "accolade"],
     "Layoffs & Restructuring": ["layoff", "layoffs", "restructuring", "job cuts", "workforce reduction"],
-    "Financial Results": ["quarterly results", "annual report", "revenue", "earnings", "financial results"],
+    "Financial Results": ["quarterly results", "annual report", "revenue", "earnings", "financial results", "quarter", "profit"],
     "Negative News (Lawsuits, Controversies, Data Breaches, Regulatory Action, Complaints)": ["lawsuit", "sues", "data breach", "controversy", "complaint", "fined", "investigation", "scandal", "outage", "disruption", "service issue"],
 }
 
@@ -171,6 +171,9 @@ def is_prominent_in_full_text(company_name: str, headline: str, full_text: str) 
     return mention_count([company_name], full_text) >= 2
 
 
+FALLBACK_CATEGORY = "Other Relevant News"
+
+
 def classify_category(text: str) -> Optional[str]:
     lower = text.lower()
     best_cat, best_hits = None, 0
@@ -197,6 +200,10 @@ def score_relevance(
     # Exact company/alias name match
     if any(name.lower() in text for name in company.all_names()):
         score += 0.35
+
+    # Company named in the HEADLINE = it is the subject of the story
+    if any(name.lower() in (headline or "").lower() for name in company.all_names()):
+        score += 0.2
 
     # Official domain match is the strongest disambiguation signal
     if company.website and _domain(company.website) and _domain(company.website) in source_domain:

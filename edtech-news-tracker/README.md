@@ -1,5 +1,19 @@
 # EdTech News Tracker
 
+> **News sources (updated):** by default the tracker now finds news through **Google News**
+> (one search per company *per country*, each in that country's own local-language Google News
+> edition) plus **Bing News**, and optionally **Serper.dev** (`SERPER_API_KEY`). These are free,
+> need no API key, and return up to 100 dated headlines per query -- far more complete than
+> Parallel's ~10 curated pages per call. Any query that returns a full page is automatically
+> split (by date, then by topic) so nothing is truncated. Every company is searched in every one
+> of the countries in the Geographies sheet (no tiering, no budget cap needed).
+> Expect ~24k requests (~1.5-2 h at the default 4 req/s). The older Parallel.ai flow is still
+> available with `NEWS_PROVIDER=parallel`; the Parallel/budget sections below apply only to it.
+> `python edtech_news_tracker.py --dry-run` shows the plan. Offline tests: `python -m unittest discover -s tests`.
+> Limits: Google News has no local edition for ~30 of the 82 countries (e.g. Cambodia, Iran,
+> Georgia); those fall back to the US edition with the country name in the query.
+
+
 A daily news-monitoring tool that tracks ~280 Ed-Tech competitor companies
 across 82 geographies, searching company websites, press-release wires, and
 local-language news sources, then produces one Excel report per run.

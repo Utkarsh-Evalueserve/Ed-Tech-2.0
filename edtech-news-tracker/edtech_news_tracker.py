@@ -2,8 +2,9 @@
 """
 EdTech News Tracker
 ====================
-Daily multilingual news monitoring for Ed-Tech competitors, powered by the
-Parallel.ai Search API.
+Daily multilingual news monitoring for Ed-Tech competitors. Finds news via Google
+News (per-country editions) + Bing News (+ optional Serper.dev), or the legacy
+Parallel.ai Search API (NEWS_PROVIDER=parallel).
 
 Run from a terminal:
     python edtech_news_tracker.py
@@ -31,6 +32,7 @@ from tracker.excel_loader import (
 )
 from tracker.exporter import RunLog, export
 from tracker.parallel_client import ParallelClient, RawResult
+from tracker.news_client import NewsSearchClient
 from tracker.budget import BudgetTracker
 from tracker.gate import edu_hits_needed, has_edu_context, is_listing_or_spam, names_a_excluded_entity, requires_edu_context
 from tracker.planner import choose_batch_size, group_geographies, plan_geo_units, unit_key
@@ -224,10 +226,15 @@ def _raw_result_to_article(
         return None
     if names_a_excluded_entity(task.company, full_excerpt):
         return None
-    if (not is_own_domain
-            and requires_edu_context(task.company, settings.edu_context_companies)
-            and not has_edu_context(full_excerpt, edu_hits_needed(task.company))):
-        return None  # e.g. Mastercard payments, Gates medical grant, Apollo private equity
+    defer_edu = 0
+    if not is_own_domain and requires_edu_context(task.company, settings.edu_context_companies):
+        needed = edu_hits_needed(task.company)
+        if (result.excerpt or "").strip() == (result.title or "").strip():
+            # Headline-only result (Google News RSS): a headline rarely carries
+            # education words, so judge the full article text later instead.
+            defer_edu = needed
+        elif not has_edu_context(full_excerpt, needed):
+            return None  # e.g. Mastercard payments, Gates medical grant, Apollo private equity
 
     category = classify_category(combined_text)
     if category is None:
@@ -279,6 +286,7 @@ def _raw_result_to_article(
         url=result.url,
         relevance_score=score,
         review_flag=review_flag,
+        edu_hits_needed=defer_edu,
     )
 
 
@@ -294,6 +302,12 @@ def run_tasks(tasks: list[SearchTask], client: ParallelClient, settings: Setting
               geographies: list[Geography], start_dt: datetime, end_dt: datetime) -> list[Article]:
     articles: list[Article] = []
     for task in tasks:
+        if hasattr(client, "search_task"):  # Google/Bing/Serper client
+            for r in client.search_task(task, start_dt, end_dt):
+                art = _raw_result_to_article(r, task, geographies, settings, start_dt, end_dt)
+                if art:
+                    articles.append(art)
+            continue
         max_results = (
             settings.geography_max_results_per_query
             if task.lane == "geography"
@@ -316,6 +330,7 @@ def _run_units(units, fn, client, completed, articles, settings, start_tag, end_
     """Runs units (key, callable-args) concurrently; checkpoints each finished
     unit. Units skipped because the budget ran out are NOT marked completed,
     so a rerun with a higher BUDGET_USD resumes exactly where this stopped."""
+    last_save = [time.time()]
     with ThreadPoolExecutor(max_workers=settings.max_concurrent_requests) as pool:
         futures = {pool.submit(fn, *args): (key, name) for key, name, args in units}
         for fut in tqdm(as_completed(futures), total=len(futures), desc=desc, unit="call"):
@@ -331,7 +346,12 @@ def _run_units(units, fn, client, completed, articles, settings, start_tag, end_
                 zero_news.append(name)
             articles.extend(res)
             completed.append(key)
-            checkpoint.save(settings.checkpoint_dir, start_tag, end_tag, completed, articles)
+            # Rewriting the pickle after each of ~23k units is quadratic; save
+            # at most every 20s (an interruption loses <20s of work).
+            if time.time() - last_save[0] >= 20:
+                checkpoint.save(settings.checkpoint_dir, start_tag, end_tag, completed, articles)
+                last_save[0] = time.time()
+    checkpoint.save(settings.checkpoint_dir, start_tag, end_tag, completed, articles)
 
 
 def _append_flag(existing: str, note: str) -> str:
@@ -416,6 +436,9 @@ def enrich_with_full_summaries(
                 # Full-text extraction failed -- at least clean the
                 # short fallback excerpt of any nav/boilerplate junk
                 # it may carry, rather than leaving it raw.
+                if art.edu_hits_needed and not has_edu_context(f"{art.headline_en} {art.summary_en}", art.edu_hits_needed):
+                    to_drop.add(id(art))
+                    continue
                 art.summary_en = clean_short_summary(art.summary_en)
                 art.review_flag = _append_flag(art.review_flag, "Full article unavailable - short summary only")
                 continue
@@ -445,6 +468,10 @@ def enrich_with_full_summaries(
                 to_drop.add(id(art))
                 continue
 
+            if art.edu_hits_needed and not has_edu_context(translated[:3000], art.edu_hits_needed):
+                to_drop.add(id(art))  # same-named non-education entity (judged on the full text)
+                continue
+
             art.summary_en = summarize(
                 translated, focus_terms=[art.company], target_words=450, max_words=500
             )
@@ -454,12 +481,30 @@ def enrich_with_full_summaries(
     return [a for a in articles if id(a) not in to_drop]
 
 
+def resolve_publisher_urls(articles: list[Article], client) -> list[Article]:
+    """Google News links are redirects; swap each for the real publisher URL
+    (done once per surviving story, after dedup), re-run the listing/homepage
+    checks on the real URL, and merge stories that now share a URL."""
+    all_urls = [a.url for a in articles] + [u for a in articles for u in a.other_source_urls]
+    print(f"Resolving {len(set(all_urls))} news links to publisher URLs...")
+    mapping = client.resolve_urls(all_urls)
+    kept: list[Article] = []
+    for a in articles:
+        a.url = mapping.get(a.url, a.url)
+        a.other_source_urls = [mapping.get(u, u) for u in a.other_source_urls]
+        if "news.google.com/" not in a.url:
+            if is_generic_page(a.url, a.headline_en, a.source_name) or is_listing_or_spam(a.url, a.headline_en, ""):
+                continue
+        kept.append(a)
+    return deduplicate(kept)
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description="EdTech News Tracker (budget-capped)")
     ap.add_argument("--date", help="single reporting date YYYY-MM-DD (skips the prompt)")
     ap.add_argument("--start", help="window start YYYY-MM-DD")
     ap.add_argument("--end", help="window end YYYY-MM-DD")
-    ap.add_argument("--budget", type=float, help="max USD of Parallel.ai spend for this run (default 25)")
+    ap.add_argument("--budget", type=float, help="[NEWS_PROVIDER=parallel only] max USD of Parallel.ai spend (default 25)")
     ap.add_argument("--geo-batch", help="countries per search call: integer or 'auto' (default)")
     ap.add_argument("--dry-run", action="store_true", help="print the cost/coverage plan without calling the API")
     return ap.parse_args()
@@ -508,50 +553,80 @@ def main() -> int:
         print(f"\nResuming previous run: {len(completed_companies)} company/companies already completed.")
 
     start_s, end_s = start_tag, end_tag
-    budget = BudgetTracker(settings.budget_usd, settings.checkpoint_dir / f"spend_{start_tag}_to_{end_tag}.json")
-    hold_back = settings.budget_usd * (settings.extract_reserve_fraction + settings.safety_margin_fraction)
+    free = settings.news_provider != "parallel"
+    if free:
+        budget = None
+        hold_back = 0.0
+        core_todo = [c for c in companies if unit_key("core", c) not in completed_companies]
+        if settings.country_sweep == "none":
+            groups = []
+        else:  # one search per (company, country), each in that country's own Google News edition
+            groups = group_geographies(geographies, 1, settings.geo_priority_countries)
+        geo_todo = [(c, gi) for c, gi in plan_geo_units(companies, groups)
+                    if unit_key("geo", c, gi) not in completed_companies]
+        planned_geo = len(geo_todo)
+        serper = int(bool(settings.serper_api_key))
+        n_req = len(core_todo) * (2 + int(settings.use_bing) + serper) + planned_geo * (
+            1 + serper + int(settings.use_bing and settings.bing_per_country))
+        sources = "Google News" + (" + Bing News" if settings.use_bing else "") + (" + Serper" if serper else "")
+        print(f"\nSearch plan (sources: {sources}; no per-call cost):")
+        print(f"  Companies                : {len(companies)}  ({len(core_todo)} global searches still to do)")
+        print(f"  Countries (own edition)  : {len(groups)}  -> {planned_geo} company-country searches")
+        print(f"  Approx. HTTP requests    : ~{n_req}  at {settings.requests_per_second:g}/s "
+              f"=> ~{n_req / max(settings.requests_per_second, 0.1) / 60:.0f} min")
+        if args.dry_run:
+            print("\nDry run only -- no requests made.")
+            return 0
+        client = NewsSearchClient(
+            serper_key=settings.serper_api_key, use_bing=settings.use_bing,
+            bing_per_country=settings.bing_per_country, requests_per_second=settings.requests_per_second,
+            max_retries=settings.max_retries, backoff_base=settings.backoff_base_seconds,
+        )
+    else:
+        budget = BudgetTracker(settings.budget_usd, settings.checkpoint_dir / f"spend_{start_tag}_to_{end_tag}.json")
+        hold_back = settings.budget_usd * (settings.extract_reserve_fraction + settings.safety_margin_fraction)
 
-    core_todo = [c for c in companies if unit_key("core", c) not in completed_companies]
-    search_budget = settings.budget_usd - hold_back - budget.spent
-    core_cost = len(core_todo) * 2 * settings.search_cost_usd
-    geo_calls_available = max(0, int((search_budget - core_cost) / settings.search_cost_usd))
-    done_geo = sum(1 for k in completed_companies if k.startswith("geo::"))
-    batch_size = choose_batch_size(settings.geo_batch_size, geographies, len(companies),
-                                   geo_calls_available + done_geo, settings.geo_batch_max,
-                                   settings.geo_priority_countries)
-    groups = group_geographies(geographies, batch_size, settings.geo_priority_countries)
-    geo_units_all = plan_geo_units(companies, groups)
-    geo_todo = [(c, gi) for c, gi in geo_units_all if unit_key("geo", c, gi) not in completed_companies]
-    planned_geo = min(len(geo_todo), geo_calls_available)
-    total_cost = core_cost + planned_geo * settings.search_cost_usd
+        core_todo = [c for c in companies if unit_key("core", c) not in completed_companies]
+        search_budget = settings.budget_usd - hold_back - budget.spent
+        core_cost = len(core_todo) * 2 * settings.search_cost_usd
+        geo_calls_available = max(0, int((search_budget - core_cost) / settings.search_cost_usd))
+        done_geo = sum(1 for k in completed_companies if k.startswith("geo::"))
+        batch_size = choose_batch_size(settings.geo_batch_size, geographies, len(companies),
+                                       geo_calls_available + done_geo, settings.geo_batch_max,
+                                       settings.geo_priority_countries)
+        groups = group_geographies(geographies, batch_size, settings.geo_priority_countries)
+        geo_units_all = plan_geo_units(companies, groups)
+        geo_todo = [(c, gi) for c, gi in geo_units_all if unit_key("geo", c, gi) not in completed_companies]
+        planned_geo = min(len(geo_todo), geo_calls_available)
+        total_cost = core_cost + planned_geo * settings.search_cost_usd
 
-    print(f"\nBudget plan (cap ${settings.budget_usd:.2f}, ~${settings.search_cost_usd}/search, "
-          f"~${settings.extract_cost_usd}/URL extract):")
-    print(f"  Core searches (official + global) : {len(core_todo) * 2}  (~${core_cost:.2f})")
-    print(f"  Country groups                    : {len(groups)} groups of up to {batch_size} countries "
-          f"-> {len(geo_todo)} calls needed for full coverage")
-    print(f"  Country calls affordable          : {planned_geo}  (~${planned_geo * settings.search_cost_usd:.2f})")
-    print(f"  Held back for extraction + margin : ~${hold_back:.2f}")
-    print(f"  Estimated search spend            : ~${total_cost:.2f}")
-    if planned_geo < len(geo_todo):
-        print(f"  NOTE: budget covers {planned_geo}/{len(geo_todo)} company-country-group calls; priority "
-              f"countries first, spread evenly across companies. Raise BUDGET_USD or GEO_BATCH_MAX for more.")
-    if args.dry_run:
-        print("\nDry run only -- no API calls made.")
-        return 0
+        print(f"\nBudget plan (cap ${settings.budget_usd:.2f}, ~${settings.search_cost_usd}/search, "
+              f"~${settings.extract_cost_usd}/URL extract):")
+        print(f"  Core searches (official + global) : {len(core_todo) * 2}  (~${core_cost:.2f})")
+        print(f"  Country groups                    : {len(groups)} groups of up to {batch_size} countries "
+              f"-> {len(geo_todo)} calls needed for full coverage")
+        print(f"  Country calls affordable          : {planned_geo}  (~${planned_geo * settings.search_cost_usd:.2f})")
+        print(f"  Held back for extraction + margin : ~${hold_back:.2f}")
+        print(f"  Estimated search spend            : ~${total_cost:.2f}")
+        if planned_geo < len(geo_todo):
+            print(f"  NOTE: budget covers {planned_geo}/{len(geo_todo)} company-country-group calls; priority "
+                  f"countries first, spread evenly across companies. Raise BUDGET_USD or GEO_BATCH_MAX for more.")
+        if args.dry_run:
+            print("\nDry run only -- no API calls made.")
+            return 0
 
-    client = ParallelClient(
-        api_key=settings.api_key,
-        max_concurrent=settings.max_concurrent_requests,
-        max_retries=settings.max_retries,
-        backoff_base=settings.backoff_base_seconds,
-        mode=settings.parallel_mode,
-        max_results=settings.max_results_per_query,
-        budget=budget,
-        search_cost=settings.search_cost_usd,
-        extract_cost=settings.extract_cost_usd,
-    )
-    client.search_floor_remaining = hold_back
+        client = ParallelClient(
+            api_key=settings.api_key,
+            max_concurrent=settings.max_concurrent_requests,
+            max_retries=settings.max_retries,
+            backoff_base=settings.backoff_base_seconds,
+            mode=settings.parallel_mode,
+            max_results=settings.max_results_per_query,
+            budget=budget,
+            search_cost=settings.search_cost_usd,
+            extract_cost=settings.extract_cost_usd,
+        )
+        client.search_floor_remaining = hold_back
 
     run_start_time = time.time()
     zero_news_companies: list[str] = []
@@ -560,8 +635,9 @@ def main() -> int:
     def core_unit(c):
         if not client.can_search():
             return None
-        return run_tasks([build_official_press_task(c, s_str, e_str), build_global_broad_task(c, s_str, e_str)],
-                         client, settings, geographies, start_dt, end_dt)
+        tasks = [build_global_broad_task(c, s_str, e_str)] if free else [
+            build_official_press_task(c, s_str, e_str), build_global_broad_task(c, s_str, e_str)]
+        return run_tasks(tasks, client, settings, geographies, start_dt, end_dt)
 
     def geo_unit(c, gi):
         if not client.can_search():
@@ -586,7 +662,7 @@ def main() -> int:
             return None
         return run_tasks(build_topic_tasks(c, s_str, e_str), client, settings, geographies, start_dt, end_dt)
 
-    deep_todo = [c for c in companies if c.name in SATURATED and unit_key("deep", c) not in completed_companies]
+    deep_todo = [] if free else [c for c in companies if c.name in SATURATED and unit_key("deep", c) not in completed_companies]
     if deep_todo and client.can_search():
         print(f"\nDeep dive for {len(deep_todo)} high-volume companies (3 topic searches each, budget permitting)...")
         try:
@@ -605,6 +681,9 @@ def main() -> int:
 
     print("Deduplicating articles across sources and languages...")
     deduped = deduplicate(articles)
+
+    if hasattr(client, "resolve_urls"):
+        deduped = resolve_publisher_urls(deduped, client)
 
     print(f"Fetching full article text for {len(deduped)} articles and writing summaries...")
     deduped = enrich_with_full_summaries(deduped, client, settings, start_dt, end_dt)
@@ -628,7 +707,11 @@ def main() -> int:
     print(f"Companies with zero news found: {len(zero_news_companies)}")
     print(f"Failed queries (after retries): {len(still_failed)}")
     print(f"Run duration: {run_log.duration_seconds:.1f}s")
-    print(f"Spend: {budget.summary()}")
+    if budget is not None:
+        print(f"Spend: {budget.summary()}")
+    else:
+        print(f"HTTP requests made: {client.request_count} (free sources, no spend); "
+              f"queries auto-split to avoid truncation: {client.truncated_splits}")
     print("=" * 70)
     return 0
 

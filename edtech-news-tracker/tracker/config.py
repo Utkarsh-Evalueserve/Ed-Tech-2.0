@@ -58,6 +58,20 @@ PRESS_WIRE_DOMAINS = [
 @dataclass
 class Settings:
     api_key: str
+    # Which engine finds the news:
+    #   "google"   (default) Google News (per-country editions) + Bing News, plus
+    #              Serper.dev if SERPER_API_KEY is set. Free, key-less, far more complete.
+    #   "parallel" the original Parallel.ai Search API (needs PARALLEL_API_KEY, budget-capped).
+    news_provider: str = os.getenv("NEWS_PROVIDER", "google").strip().lower()
+    serper_api_key: str = os.getenv("SERPER_API_KEY", "").strip()
+    use_bing: bool = os.getenv("USE_BING_NEWS", "true").strip().lower() not in {"0", "false", "no"}
+    bing_per_country: bool = os.getenv("BING_PER_COUNTRY", "false").strip().lower() in {"1", "true", "yes"}
+    # Global request pace against Google/Bing (they throttle by IP; 429s also
+    # slow the whole client down automatically). Raise it only with Serper/proxies.
+    requests_per_second: float = float(os.getenv("REQUESTS_PER_SECOND", "4"))
+    # "all" = every company x every country (default for Google, it is free);
+    # "none" = global searches only.
+    country_sweep: str = os.getenv("COUNTRY_SWEEP", "all").strip().lower()
     excel_path: Path = PROJECT_ROOT / "edtech_tracking_list.xlsx"
     output_dir: Path = PROJECT_ROOT / "output"
     checkpoint_dir: Path = PROJECT_ROOT / ".state"
@@ -152,6 +166,8 @@ def load_settings(require_key: bool = True) -> Settings:
     load_dotenv(PROJECT_ROOT / ".env")
 
     api_key = os.getenv("PARALLEL_API_KEY", "").strip()
+    if os.getenv("NEWS_PROVIDER", "google").strip().lower() != "parallel":
+        return Settings(api_key=api_key)  # Google/Bing/Serper need no Parallel key
     if not api_key and not require_key:
         api_key = "dry-run"
     if not api_key:

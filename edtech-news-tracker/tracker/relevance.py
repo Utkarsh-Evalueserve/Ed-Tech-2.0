@@ -86,6 +86,9 @@ class Article:
     review_flag: str
     other_source_urls: List[str] = field(default_factory=list)
     _dedup_key: str = ""
+    # >0 = education-context check was deferred (search result carried only a
+    # headline) and must be applied to the full article text instead.
+    edu_hits_needed: int = 0
 
 
 def is_excluded_noise(text: str, matched_category: Optional[str]) -> bool:
